@@ -1,0 +1,390 @@
+# -*- coding: utf-8 -*-
+from flask import Flask, render_template_string, request, jsonify, session, redirect, url_for, Response
+import time
+import sys
+import os
+import threading # Canlılık kontrolü için
+
+# ==========================================
+# 1. GÜVENLİ MODÜL YÜKLEME
+# ==========================================
+MODULE_ERROR = None
+try:
+    from kamera import VideoCamera
+    from arduino_yoneticisi import ArduinoManager
+except ImportError as e:
+    MODULE_ERROR = f"Modül Hatası: {e}. 'kamera.py' ve 'arduino_yoneticisi.py' dosyaları eksik."
+    print(f"❌ {MODULE_ERROR}", flush=True)
+    
+    class VideoCamera:
+        def get_frame(self): return None
+        def get_alert(self): return "Sistem Hatası: Kamera Modülü Yok"
+    class ArduinoManager:
+        def __init__(self, **kwargs): self.running = False
+        def baslat(self): pass
+        def gonder(self, cmd): return False
+
+# ==========================================
+# 2. AYARLAR VE GLOBAL DEĞİŞKENLER
+# ==========================================
+
+USERS = {
+    "emre": "1234",
+    "arif": "0000",
+    "sedat": "1111"
+}
+
+sys_state = {
+    "l1": False, "l2": False, "temp": 22, "brightness": 50, "arduino_connected": False
+}
+
+app = Flask(__name__)
+app.secret_key = 'super_gizli_anahtar_123'
+app.config['JSON_AS_ASCII'] = False
+
+global_camera = None
+arduino = None
+
+# ==========================================
+# 3. YARDIMCI FONKSİYONLAR (LOG & INFO)
+# ==========================================
+def sistem_bilgilendirme():
+    """Kullanıcıya sistemin hazır olduğunu ve hangi adrese gideceğini söyler."""
+    time.sleep(5) # Diğer logların bitmesini bekle
+    print("\n" + "="*50, flush=True)
+    print("✅  SİSTEM TAMAMEN BAŞLATILDI VE HAZIR!", flush=True)
+    print("="*50, flush=True)
+    print("Web arayüzüne girmek için tarayıcıda şunu açın:", flush=True)
+    
+    # IP adresini otomatik bulmaya çalışalım, bulamazsak standart mesaj
+    try:
+        import socket
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        print(f"👉  https://{ip}:5000", flush=True)
+    except:
+        print("👉  https://<RASPBERRY_PI_IP_ADRESI>:5000", flush=True)
+        
+    print("\n⚠️  NOT: Tarayıcıda 'Güvenli Değil' uyarısı çıkarsa;", flush=True)
+    print("    'Gelişmiş' -> 'Siteye İlerle (Güvenli Değil)' seçeneğine tıklayın.", flush=True)
+    print("="*50 + "\n", flush=True)
+
+    # Sistemin donmadığını kanıtlamak için periyodik mesaj
+    while True:
+        time.sleep(60)
+        print("💓 Sistem Aktif ve Dinliyor... (Donma Yok)", flush=True)
+
+# ==========================================
+# 4. DONANIMLARI BAŞLATMA
+# ==========================================
+
+# --- KAMERA BAŞLATMA ---
+try:
+    print("📷 Kamera başlatılıyor...", flush=True)
+    global_camera = VideoCamera()
+except Exception as e:
+    print(f"⚠️ Kamera hatası: {e}", flush=True)
+
+# --- ARDUINO BAŞLATMA ---
+try:
+    print("🔌 Arduino yöneticisi hazırlanıyor...", flush=True)
+    def arduino_veri_isleyici(line):
+        try:
+            if ":" in line:
+                key, value = line.split(":")
+                if key == "L1": sys_state["l1"] = (value == "1")
+                elif key == "L2": sys_state["l2"] = (value == "1")
+                elif key == "TEMP": sys_state["temp"] = int(value)
+                elif key == "BRT": sys_state["brightness"] = int(value)
+        except:
+            pass
+
+    arduino = ArduinoManager(baudrate=9600, data_handler=arduino_veri_isleyici, state_dict=sys_state)
+    arduino.baslat()
+except Exception as e:
+    print(f"⚠️ Arduino hatası: {e}", flush=True)
+
+# ==========================================
+# 5. KAMERA AKIŞI
+# ==========================================
+def gen_frames():
+    while True:
+        try:
+            if global_camera:
+                frame = global_camera.get_frame()
+                if frame:
+                    yield (b'--frame\r\n' b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n\r\n')
+                else:
+                    time.sleep(0.1)
+            else:
+                time.sleep(1)
+        except:
+            time.sleep(0.5)
+
+# ==========================================
+# 6. HTML ŞABLONLARI
+# ==========================================
+
+HTML_LOGIN = """
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Giriş Yap</title>
+    <style>
+        body { background: #1a1a2e; color: white; font-family: sans-serif; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; }
+        .login-box { background: #16213e; padding: 40px; border-radius: 15px; text-align: center; width: 100%; max-width: 320px; }
+        select, input, button { width: 100%; padding: 15px; margin: 10px 0; border-radius: 8px; border: none; font-size: 1rem; }
+        select, input { background: #0f3460; color: white; }
+        button { background: #e94560; color: white; cursor: pointer; font-weight: bold; }
+        .error { color: #e74c3c; margin-top: 10px; }
+        .sys-warning { background: #d35400; padding: 10px; border-radius: 5px; font-size: 0.8rem; margin-bottom: 15px; }
+    </style>
+</head>
+<body>
+    <div class="login-box">
+        <h2>🔒 Güvenlik Sistemi</h2>
+        {% if module_error %}<div class="sys-warning">⚠️ {{ module_error }}</div>{% endif %}
+        <form method="POST">
+            <select name="username" required>
+                <option value="" disabled selected>Kullanıcı Seçin</option>
+                <option value="emre">Emre</option>
+                <option value="arif">Arif</option>
+                <option value="sedat">Sedat</option>
+            </select>
+            <input type="password" name="password" placeholder="Şifre" required>
+            <button type="submit">GİRİŞ YAP</button>
+        </form>
+        {% if error %}<div class="error">{{ error }}</div>{% endif %}
+    </div>
+</body>
+</html>
+"""
+
+HTML_DASHBOARD = """
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Kontrol Paneli</title>
+    <style>
+        body { background: #0f3460; color: white; font-family: sans-serif; text-align: center; padding: 20px; }
+        .header { display: flex; justify-content: space-between; border-bottom: 1px solid #e94560; padding-bottom: 20px; margin-bottom: 20px; }
+        .btn-logout { color: white; text-decoration: none; border: 1px solid white; padding: 5px 15px; border-radius: 15px; }
+        .card { background: #16213e; padding: 20px; border-radius: 15px; margin-bottom: 20px; }
+        .switch-container { display: flex; gap: 10px; }
+        .btn-toggle { flex: 1; padding: 25px; border-radius: 12px; border: none; font-weight: bold; cursor: pointer; font-size: 1rem; }
+        .on { background: #2ecc71; color: black; }
+        .off { background: #333; color: #888; }
+        .camera-container { width: 100%; border: 3px solid #e94560; border-radius: 10px; overflow: hidden; background: #000; min-height: 200px; }
+        .camera-img { width: 100%; display: block; }
+        .alert-box { background-color: #e74c3c; color: white; padding: 15px; border-radius: 10px; font-weight: bold; display: none; animation: blink 1s infinite; margin-bottom: 20px; }
+        @keyframes blink { 0% { opacity: 1; } 50% { opacity: 0.7; } 100% { opacity: 1; } }
+        .status-badge { font-size: 0.8rem; padding: 5px 10px; border-radius: 12px; }
+        .connected { background: #2ecc71; color: black; }
+        .disconnected { background: #e74c3c; color: white; }
+        .notif-btn { background: #2980b9; color: white; padding: 5px 10px; border: none; border-radius: 5px; cursor: pointer; font-size: 0.8rem; margin-top: 5px; }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <div>
+            👤 {{ user|upper }} <span id="conn-status" class="status-badge disconnected">Bağlanıyor...</span><br>
+            <button onclick="requestNotificationPermission()" class="notif-btn">🔔 Bildirimleri Aç</button>
+        </div>
+        <a href="/logout" class="btn-logout">Çıkış</a>
+    </div>
+
+    <div id="security-alert" class="alert-box">⚠️ Hareket Algılandı!</div>
+
+    <div class="card">
+        <h3>📷 Güvenlik Kamerası</h3>
+        <div class="camera-container">
+            <img id="cam-stream" src="/video_feed" class="camera-img" onerror="this.style.display='none'; setTimeout(() => { this.src='/video_feed?'+new Date().getTime(); this.style.display='block'; }, 3000);">
+        </div>
+    </div>
+
+    <div class="card">
+        <h3>💡 Aydınlatma</h3>
+        <div class="switch-container">
+            <button id="btn-l1" class="btn-toggle off" onclick="toggle('l1')">SALON</button>
+            <button id="btn-l2" class="btn-toggle off" onclick="toggle('l2')">MUTFAK</button>
+        </div>
+    </div>
+
+    <div class="card">
+        <h3>🌡️ Sıcaklık: <span id="temp-display" style="color:#e94560">--°C</span></h3>
+    </div>
+
+    <script>
+        let lastNotificationMsg = "";
+
+        function requestNotificationPermission() {
+            if (!("Notification" in window)) {
+                alert("Tarayıcınız bildirimleri desteklemiyor.");
+            } else {
+                Notification.requestPermission().then(permission => {
+                    if (permission === "granted") {
+                        new Notification("Bildirimler Aktif!", { body: "Hareket algılandığında haber vereceğiz." });
+                    } else if (permission === "denied") {
+                        alert("Bildirim izni reddedildi. Tarayıcı ayarlarından (Kilit simgesi) izin vermelisiniz.");
+                    }
+                });
+            }
+        }
+
+        function sendWebNotification(msg) {
+            if (Notification.permission === "granted" && msg !== "") {
+                if (msg !== lastNotificationMsg) {
+                    new Notification("GÜVENLİK UYARISI!", { body: msg, vibrate: [200, 100, 200] });
+                    lastNotificationMsg = msg;
+                    setTimeout(() => { lastNotificationMsg = ""; }, 5000);
+                }
+            }
+        }
+
+        setInterval(() => {
+            fetch('/api/status').then(r=>r.json()).then(d => {
+                document.getElementById('btn-l1').className = d.l1 ? 'btn-toggle on' : 'btn-toggle off';
+                document.getElementById('btn-l2').className = d.l2 ? 'btn-toggle on' : 'btn-toggle off';
+                document.getElementById('temp-display').innerText = d.temp + '°C';
+                const st = document.getElementById('conn-status');
+                st.className = d.arduino_connected ? 'status-badge connected' : 'status-badge disconnected';
+                st.innerText = d.arduino_connected ? 'ARDUINO: AKTİF' : 'ARDUINO: PASİF';
+            }).catch(e=>{});
+
+            fetch('/api/alerts').then(r=>r.json()).then(d => {
+                const box = document.getElementById('security-alert');
+                if(d.alert) {
+                    box.style.display = 'block';
+                    box.innerText = d.alert;
+                    box.style.backgroundColor = d.alert.includes("İNSAN") ? "#e74c3c" : "#f39c12";
+                    sendWebNotification(d.alert);
+                } else {
+                    box.style.display = 'none';
+                }
+            }).catch(e=>{});
+        }, 1000);
+
+        function toggle(l) { fetch('/api/toggle/'+l, {method:'POST'}); }
+        
+        if ("Notification" in window && Notification.permission !== "granted" && Notification.permission !== "denied") {
+            Notification.requestPermission();
+        }
+    </script>
+</body>
+</html>
+"""
+
+# ==========================================
+# 7. ROTALAR
+# ==========================================
+
+@app.route('/', methods=['GET', 'POST'])
+def login():
+    if 'user' in session: return redirect(url_for('dashboard'))
+    error = None
+    if request.method == 'POST':
+        u = request.form.get('username')
+        p = request.form.get('password')
+        if u in USERS and USERS[u] == p:
+            session['user'] = u
+            if arduino: arduino.gonder(f"LOGIN:{u}")
+            return redirect(url_for('dashboard'))
+        else:
+            error = "Hatalı Şifre!"
+    return render_template_string(HTML_LOGIN, error=error, module_error=MODULE_ERROR)
+
+@app.route('/dashboard')
+def dashboard():
+    if 'user' not in session: return redirect(url_for('login'))
+    return render_template_string(HTML_DASHBOARD, user=session['user'], module_error=MODULE_ERROR)
+
+@app.route('/logout')
+def logout():
+    session.pop('user', None)
+    if arduino: arduino.gonder("LOGOUT")
+    return redirect(url_for('login'))
+
+@app.route('/video_feed')
+def video_feed():
+    if 'user' not in session: return "Yetkisiz", 401
+    return Response(gen_frames(), mimetype='multipart/x-mixed-replace; boundary=frame')
+
+@app.route('/api/alerts')
+def get_alerts():
+    return jsonify({"alert": global_camera.get_alert() if global_camera else ""})
+
+@app.route('/api/status')
+def get_status(): return jsonify(sys_state)
+
+@app.route('/api/sync', methods=['POST'])
+def api_sync():
+    if 'user' in session and arduino:
+        arduino.gonder(f"LOGIN:{session['user']}")
+        arduino.gonder(f"L1:{'1' if sys_state['l1'] else '0'}")
+        arduino.gonder(f"L2:{'1' if sys_state['l2'] else '0'}")
+    return jsonify({"success":True})
+
+@app.route('/api/toggle/<light>', methods=['POST'])
+def api_toggle(light):
+    if 'user' in session and light in sys_state:
+        sys_state[light] = not sys_state[light]
+        if arduino: arduino.gonder(f"{light.upper()}:{'1' if sys_state[light] else '0'}")
+        return jsonify({"success":True})
+    return jsonify({"error":"Yetkisiz"}), 401
+
+@app.route('/api/temp/<action>', methods=['POST'])
+def api_temp(action):
+    if 'user' in session:
+        if action == 'up': sys_state["temp"] += 1
+        elif action == 'down': sys_state["temp"] -= 1
+        if arduino: arduino.gonder(f"TEMP:{sys_state['temp']}")
+        return jsonify({"success":True})
+    return jsonify({"error":"Yetkisiz"}), 401
+
+@app.route('/api/brt/<int:val>', methods=['POST'])
+def api_brt(val):
+    if 'user' in session:
+        sys_state["brightness"] = val
+        if arduino: arduino.gonder(f"BRT:{val}")
+        return jsonify({"success":True})
+    return jsonify({"error":"Yetkisiz"}), 401
+
+if __name__ == '__main__':
+    try:
+        # Bilgilendirme Thread'ini Başlat
+        threading.Thread(target=sistem_bilgilendirme, daemon=True).start()
+
+        # Sertifika kontrolü
+        use_ssl = False
+        if os.path.exists('cert.pem') and os.path.exists('key.pem'):
+            use_ssl = True
+        else:
+            print("⚠️ Sertifikalar bulunamadı! HTTP (Güvensiz) deneniyor...", flush=True)
+
+        print("🚀 Flask Sunucusu Başlatılıyor (Port 5000)...", flush=True)
+        
+        if use_ssl:
+            try:
+                app.run(host='0.0.0.0', port=5000, debug=False, threaded=True, ssl_context=('cert.pem', 'key.pem'))
+            except Exception as e:
+                print(f"❌ HTTPS Hatası: {e}. HTTP'ye dönülüyor...", flush=True)
+                app.run(host='0.0.0.0', port=5000, debug=False, threaded=True)
+        else:
+            # 2. Seçenek: Adhoc (Otomatik Sertifika)
+            try:
+                app.run(host='0.0.0.0', port=5000, debug=False, threaded=True, ssl_context='adhoc')
+            except:
+                print("⚠️ Adhoc başarısız. Saf HTTP başlatılıyor...", flush=True)
+                app.run(host='0.0.0.0', port=5000, debug=False, threaded=True)
+            
+    except KeyboardInterrupt:
+        print("\nKapatılıyor...", flush=True)
+        if arduino: arduino.running = False
+    except Exception as e:
+        print(f"\n❌ KRİTİK HATA: {e}", flush=True)
